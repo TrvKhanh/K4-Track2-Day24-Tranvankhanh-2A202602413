@@ -59,7 +59,13 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+from datetime import datetime, timezone
 from pathlib import Path
+
+from agent import ledger, policy, tools
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
@@ -69,6 +75,107 @@ class RunnerScaffoldPending(NotImplementedError):
     """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
 
 
+def _build_context(principal_id: str, requested_tool: str, *, data_classification: str,
+                   request_purpose: str = "support-reply", agent_scopes: tuple[str, ...] = (),
+                   parent_scopes: tuple[str, ...] = (), delegation_depth: int = 0,
+                   egress_enabled: bool = False) -> policy.PolicyContext:
+    return policy.PolicyContext(
+        data_classification=data_classification,
+        request_purpose=request_purpose,
+        agent_owner="lab24-agent/run-b",
+        delegation_depth=delegation_depth,
+        egress_enabled=egress_enabled,
+        principal_id=principal_id,
+        requested_tool=requested_tool,
+        agent_scopes=agent_scopes,
+        parent_scopes=parent_scopes,
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+
+
+def _append_entry(log_dir: Path, *, principal_id: str, requested_tool: str, allowed: bool,
+                 reason: str, data_classification: str, request_purpose: str = "support-reply",
+                 args: dict | None = None, agent_scopes: tuple[str, ...] = ()) -> dict:
+    path = log_dir / "ledger.jsonl"
+    record = {
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "agent_id": "lab24-agent",
+        "run_id": f"{principal_id}-run",
+        "tool": requested_tool,
+        "args_hash": hashlib.sha256(
+            json.dumps(args or {}, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest(),
+        "classification": data_classification,
+        "decision": "allow" if allowed else "deny",
+        "reason": reason,
+        "on_behalf_of": principal_id,
+        "expires_at": "2099-01-01T00:00:00+00:00",
+        "request_purpose": request_purpose,
+        "agent_scopes": list(agent_scopes),
+    }
+    return ledger.append(record, path)
+
+
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    log_dir = Path(log_dir) if log_dir is not None else DEFAULT_LEDGER_PATH.parent
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    docs = tools.search_docs(message)
+    search_context = _build_context(
+        principal_id,
+        "search_docs",
+        data_classification="internal",
+        request_purpose="summarize-tickets",
+        agent_scopes=("search_docs", "read_customer"),
+    )
+    allowed, reason = policy.check(search_context)
+    _append_entry(
+        log_dir,
+        principal_id=principal_id,
+        requested_tool="search_docs",
+        allowed=allowed,
+        reason=reason,
+        data_classification="internal",
+        request_purpose="summarize-tickets",
+        args={"query": message},
+        agent_scopes=("search_docs", "read_customer"),
+    )
+    if not allowed:
+        return llm.summarize([])
+
+    _ = llm.find_injection("\n\n".join(doc["text"] for doc in docs))
+
+    customer_ids: set[str] = set()
+    for doc in docs:
+        for match in re.findall(r"ticket-(\d+)", doc["id"]):
+            ticket_id = int(match)
+            customers = json.loads((Path(__file__).resolve().parent.parent / "data" / "customers.json").read_text(encoding="utf-8"))
+            for customer in customers:
+                if ticket_id in customer.get("related_tickets", []):
+                    customer_ids.add(str(customer["customer_id"]))
+
+    for customer_id in sorted(customer_ids):
+        context = _build_context(
+            principal_id,
+            "read_customer",
+            data_classification="restricted",
+            request_purpose="support-reply",
+            agent_scopes=("search_docs", "read_customer"),
+        )
+        allowed, reason = policy.check(context)
+        _append_entry(
+            log_dir,
+            principal_id=principal_id,
+            requested_tool="read_customer",
+            allowed=allowed,
+            reason=reason,
+            data_classification="restricted",
+            request_purpose="support-reply",
+            args={"customer_id": customer_id},
+            agent_scopes=("search_docs", "read_customer"),
+        )
+        if allowed:
+            tools.read_customer(customer_id)
+
+    return llm.summarize(docs)

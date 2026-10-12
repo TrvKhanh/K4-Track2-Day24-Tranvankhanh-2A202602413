@@ -34,7 +34,10 @@ không phải xác thực người dùng production.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -51,5 +54,55 @@ class PolicyContext:
     expires_at: str = ""
 
 
+def _load_principals() -> dict[str, dict]:
+    path = Path(__file__).resolve().parent.parent / "data" / "principals.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _parse_iso_utc(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        return datetime.fromisoformat(value).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    # Rule tối thiểu bắt buộc: dữ liệu restricted + egress enabled = deny.
+    if context.data_classification == "restricted" and context.egress_enabled is True:
+        return False, "restricted data cannot egress; egress_enabled=True is denied"
+
+    principal = _load_principals().get(context.principal_id)
+    if principal is None:
+        return False, f"unknown principal_id={context.principal_id!r}"
+
+    expires_at = _parse_iso_utc(context.expires_at)
+    if expires_at is None or expires_at <= datetime.now(timezone.utc):
+        return False, f"run expired or missing expiration: expires_at={context.expires_at!r}"
+
+    if context.request_purpose not in principal.get("purposes", []):
+        return False, (
+            f"purpose {context.request_purpose!r} is not allowed for principal "
+            f"{context.principal_id!r}; allowed={principal.get('purposes', [])}"
+        )
+
+    effective_scopes = set(principal.get("allowed_tools", [])) & set(context.agent_scopes)
+    if context.delegation_depth > 0:
+        if not context.parent_scopes:
+            return False, "delegated call requires parent_scopes to constrain permissions"
+        effective_scopes &= set(context.parent_scopes)
+
+    if context.requested_tool:
+        if context.requested_tool not in effective_scopes:
+            return False, (
+                f"requested_tool={context.requested_tool!r} is not in effective scopes for "
+                f"principal={context.principal_id!r}; effective_scopes={sorted(effective_scopes)}"
+            )
+
+    return True, (
+        f"principal={context.principal_id!r} allowed to call {context.requested_tool or 'tool'} "
+        f"for purpose {context.request_purpose!r}"
+    )
